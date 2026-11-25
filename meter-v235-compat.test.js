@@ -114,3 +114,58 @@ test('v2.35.1 模拟 app.asar 可完整安装、重复清洗重装并无损还�
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
+
+test('v2.35.1 local-api 在 GET / 返回 401 时可通过 authBootstrap 与 daemon/hub_*.json 获取 CSRF Token', async () => {
+  const http = require('node:http');
+  const { connect, connectOrigin } = require('./local-api');
+
+  const expectedToken = 'v235-bootstrap-csrf-token';
+  const server = http.createServer((req, res) => {
+    if (req.url === '/') {
+      res.writeHead(401, { 'Content-Type': 'text/plain' });
+      res.end('Unauthorized: bootstrap token required');
+      return;
+    }
+    if (req.url === '/exa.language_server_pb.LanguageServerService/GetUserStatus') {
+      if (req.headers['x-codeium-csrf-token'] !== expectedToken) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('Invalid CSRF');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ userStatus: { email: 'user@example.com' } }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const origin = `http://127.0.0.1:${port}`;
+  const tmpDaemon = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-v235-daemon-'));
+
+  try {
+    // 1) 通过主进程 authBootstrap 回退鉴权
+    const api1 = await connectOrigin(origin, null, [origin], {
+      _authBootstrap: {
+        getActiveLsBaseUrl: () => origin,
+        getActiveLsCsrfToken: () => expectedToken
+      }
+    });
+    const r1 = await api1.call('GetUserStatus', {});
+    assert.equal(r1.userStatus.email, 'user@example.com');
+
+    // 2) 通过 daemon/hub_*.json 回退鉴权
+    fs.writeFileSync(
+      path.join(tmpDaemon, `hub_${port}.json`),
+      JSON.stringify({ pid: process.pid, httpsPort: port, httpPort: port, csrfToken: expectedToken })
+    );
+    const api2 = await connect({ origin, daemonDir: tmpDaemon });
+    const r2 = await api2.call('GetUserStatus', {});
+    assert.equal(r2.userStatus.email, 'user@example.com');
+  } finally {
+    server.close();
+    fs.rmSync(tmpDaemon, { recursive: true, force: true });
+  }
+});

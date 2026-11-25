@@ -1,5 +1,6 @@
 'use strict';
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const http = require('http');
 const https = require('https');
@@ -555,6 +556,109 @@ async function extractAppConfigViaCdp(page) {
   }
 }
 
+function isInIsolatedTestEnv(options = {}) {
+  return (
+    Boolean(options && (options.appDataDir || options.homeDir || options.platform || options.isolatedTest)) ||
+    process.env.AG_METER_TEST_MODE === '1' ||
+    isIsolatedTestPath(process.env.APPDATA) ||
+    isIsolatedTestPath(process.env.AG_METER_STATE_DIR)
+  );
+}
+
+function isHostPidAlive(pid) {
+  const num = Number(pid);
+  if (!Number.isInteger(num) || num <= 0) return false;
+  try {
+    process.kill(num, 0);
+    return true;
+  } catch (e) {
+    return e?.code === 'EPERM';
+  }
+}
+
+/**
+ * 适配 Antigravity >= 2.35.1 Authenticated UI Bootstrap：
+ * 当未携带一次性 bootstrap token 请求 GET / 不再暴露 window.__APP_CONFIG__.csrfToken 时，
+ * 优先从宿主 Electron 主进程内存模块 ./authBootstrap 读取活跃 LS 鉴权，
+ * 次优在非隔离环境下从 ~/.gemini/antigravity/daemon/hub_*.json 读取存活 LS 鉴权。
+ */
+function resolveHostLsAuth(targetOrigin = null, options = {}) {
+  const normalizedTarget = targetOrigin ? normalizeLoopbackOrigin(targetOrigin) : null;
+  const targetPort = normalizedTarget ? Number(normalizedTarget.match(LOOPBACK_ORIGIN_RE)?.[1]) : null;
+
+  // 1. Electron 主进程同目录 ./authBootstrap（或测试显式注入的 options._authBootstrap）
+  try {
+    const authBootstrap =
+      options && options._authBootstrap !== undefined
+        ? options._authBootstrap
+        : (!isInIsolatedTestEnv(options) ? require('./authBootstrap') : null);
+    if (authBootstrap && typeof authBootstrap === 'object') {
+      const baseOrigin =
+        typeof authBootstrap.getActiveLsBaseUrl === 'function'
+          ? normalizeLoopbackOrigin(authBootstrap.getActiveLsBaseUrl())
+          : null;
+      const csrfToken =
+        typeof authBootstrap.getActiveLsCsrfToken === 'function'
+          ? String(authBootstrap.getActiveLsCsrfToken() || '').trim()
+          : '';
+      if (baseOrigin && csrfToken && (!normalizedTarget || baseOrigin === normalizedTarget)) {
+        return { origin: baseOrigin, csrfToken, source: 'authBootstrap' };
+      }
+    }
+  } catch {}
+
+  // 2. 扫描 daemon/hub_*.json（仅在显式传入 options.daemonDir 或非隔离生产环境时启用）
+  const explicitDaemonDir = options && typeof options.daemonDir === 'string' && options.daemonDir.trim()
+    ? options.daemonDir.trim()
+    : null;
+  if (!explicitDaemonDir && isInIsolatedTestEnv(options)) {
+    return null;
+  }
+  const daemonDir = explicitDaemonDir || path.join(os.homedir(), '.gemini', 'antigravity', 'daemon');
+  const checkAlive = options && typeof options.isPidAlive === 'function' ? options.isPidAlive : isHostPidAlive;
+
+  try {
+    if (!fs.existsSync(daemonDir)) return null;
+    const entries = [];
+    for (const name of fs.readdirSync(daemonDir)) {
+      if (!/^hub_.*\.json$/i.test(name)) continue;
+      const fp = path.join(daemonDir, name);
+      try {
+        const st = fs.statSync(fp);
+        const raw = JSON.parse(fs.readFileSync(fp, 'utf8'));
+        const pid = Number(raw?.pid);
+        const httpsPort = Number(raw?.httpsPort);
+        const httpPort = Number(raw?.httpPort);
+        const csrfToken = typeof raw?.csrfToken === 'string' ? raw.csrfToken.trim() : '';
+        if (!csrfToken || !checkAlive(pid)) continue;
+        if (Number.isInteger(httpsPort) && httpsPort >= 1 && httpsPort <= 65535) {
+          entries.push({
+            origin: `https://127.0.0.1:${httpsPort}`,
+            httpsPort,
+            httpPort: Number.isInteger(httpPort) ? httpPort : null,
+            csrfToken,
+            mtimeMs: Number(st.mtimeMs) || 0
+          });
+        }
+      } catch {}
+    }
+    entries.sort((a, b) => b.mtimeMs - a.mtimeMs || b.httpsPort - a.httpsPort);
+    for (const item of entries) {
+      if (!normalizedTarget) {
+        return { origin: item.origin, csrfToken: item.csrfToken, source: 'daemon_hub' };
+      }
+      if (
+        item.origin === normalizedTarget ||
+        (targetPort && (item.httpsPort === targetPort || item.httpPort === targetPort))
+      ) {
+        return { origin: normalizedTarget, csrfToken: item.csrfToken, source: 'daemon_hub' };
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
 /**
  * 解析并缓存或实时提取指定本地页面原点的 CSRF Token 并构造 RPC 客户端。
  */
@@ -565,6 +669,7 @@ async function connectOrigin(rawOrigin, page = null, origins = null, extraMeta =
   }
   let hasConfig = false;
   let token = null;
+  let initialFetchErr = null;
   try {
     const html = await request(origin + '/');
     const config = html.match(/window\.__APP_CONFIG__\s*=\s*(\{.*?\})\s*;/s);
@@ -573,15 +678,27 @@ async function connectOrigin(rawOrigin, page = null, origins = null, extraMeta =
       token = JSON.parse(config[1]).csrfToken;
     }
   } catch (err) {
-    if (!page || !page.webSocketDebuggerUrl) throw err;
+    initialFetchErr = err;
   }
 
-  if (!hasConfig && page && page.webSocketDebuggerUrl) {
+  if ((!hasConfig || !token) && page && page.webSocketDebuggerUrl) {
     const cdpCfg = await extractAppConfigViaCdp(page);
     if (cdpCfg && cdpCfg.hasConfig) {
       hasConfig = true;
       token = cdpCfg.csrfToken;
     }
+  }
+
+  if (!hasConfig || !token) {
+    const hostAuth = resolveHostLsAuth(origin, extraMeta);
+    if (hostAuth && hostAuth.csrfToken) {
+      hasConfig = true;
+      token = hostAuth.csrfToken;
+    }
+  }
+
+  if (!hasConfig && initialFetchErr && (!page || !page.webSocketDebuggerUrl)) {
+    throw initialFetchErr;
   }
 
   if (!hasConfig) {
@@ -619,19 +736,28 @@ async function connect(options = {}) {
     if (!explicitOrigin) {
       throw new Error('非法的本机回环页面地址');
     }
-    return connectOrigin(explicitOrigin, null, [explicitOrigin]);
+    return connectOrigin(explicitOrigin, null, [explicitOrigin], options);
   }
-  const { port, page, pages } = await discoverAntigravityCdp(options);
-  const origins = Array.from(
-    new Set((Array.isArray(pages) ? pages : [page]).map(item => normalizeLoopbackOrigin(item?.url)).filter(Boolean))
-  );
-  const targetOrigin = normalizeLoopbackOrigin(page.url);
-  return connectOrigin(targetOrigin, page, origins, { port, pages });
+  try {
+    const { port, page, pages } = await discoverAntigravityCdp(options);
+    const origins = Array.from(
+      new Set((Array.isArray(pages) ? pages : [page]).map(item => normalizeLoopbackOrigin(item?.url)).filter(Boolean))
+    );
+    const targetOrigin = normalizeLoopbackOrigin(page.url);
+    return connectOrigin(targetOrigin, page, origins, { ...options, port, pages });
+  } catch (cdpErr) {
+    const hostAuth = resolveHostLsAuth(null, options);
+    if (hostAuth && hostAuth.origin) {
+      return connectOrigin(hostAuth.origin, null, [hostAuth.origin], options);
+    }
+    throw cdpErr;
+  }
 }
 
 module.exports = {
   connect,
   connectOrigin,
+  resolveHostLsAuth,
   normalizeLoopbackOrigin,
   parseExplicitPort,
   getAppDataDir,

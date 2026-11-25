@@ -431,15 +431,25 @@ function cleanPreloadSource(source) {
 }
 
 /**
+ * 查找 createWindow 中的主窗口加载锚点（兼容 <=2.34 的 win.loadURL 与 >=2.35.1 的 loadHubWindowUrl）
+ * 仅当源码中恰好存在 1 处匹配时返回该锚点文本，否则返回 null。
+ */
+function findWindowLoadAnchor(source) {
+  if (!source || typeof source !== 'string') return null;
+  const matches = source.match(/ {4}void (?:win\.loadURL\(url\)|loadHubWindowUrl\(win,\s*url(?:,\s*[^)\r\n]*)?\));/g);
+  if (!matches || matches.length !== 1) return null;
+  return matches[0];
+}
+
+/**
  * 校验清洗后的 utils 结构合法性与 JavaScript 语法
  */
 function verifyCleanStructure(cleanUtils) {
   if (!cleanUtils) return false;
   if (cleanUtils.includes('installContextMeter')) return false;
   if (cleanUtils.includes(TAGS.PROXY_START) || cleanUtils.includes(TAGS.METER_UTILS_START)) return false;
-  const marker = '    void win.loadURL(url);';
   const setupNodeMarker = 'function setupNodeWrapper(env) {';
-  const structuralOk = cleanUtils.split(marker).length === 2 && cleanUtils.includes(setupNodeMarker);
+  const structuralOk = Boolean(findWindowLoadAnchor(cleanUtils)) && cleanUtils.includes(setupNodeMarker);
   return structuralOk && validateSyntax(cleanUtils, 'dist/utils.js');
 }
 
@@ -453,5 +463,6 @@ module.exports = {
   generateChinesePreloadCode,
   cleanUtilsSource,
   cleanPreloadSource,
+  findWindowLoadAnchor,
   verifyCleanStructure
 };
